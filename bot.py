@@ -1,19 +1,22 @@
 import os
 import time
 import openai
-import asyncio
 import logging
 from dotenv import load_dotenv
 from flask import Flask, request, Response
-from botbuilder.core import BotFrameworkAdapterSettings, BotFrameworkAdapter, TurnContext
-from botbuilder.schema import Activity
+from twilio.twiml.messaging_response import MessagingResponse
+from twilio.rest import Client
 
 # Load environment variables
 load_dotenv()
 
-# Credentials and keys
-APP_ID = os.getenv("MicrosoftAppId", "")
-APP_PASSWORD = os.getenv("MicrosoftAppPassword", "")
+# Twilio credentials
+TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
+TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
+TWILIO_WHATSAPP_NUMBER = os.getenv(
+    "TWILIO_WHATSAPP_NUMBER", "whatsapp:+14155238886")  # Sandbox default
+
+# Azure OpenAI
 AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY")
 AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
 ASSISTANT_ID = os.getenv("ASSISTANT_ID")
@@ -24,58 +27,42 @@ openai.api_version = "2024-05-01-preview"
 openai.api_key = AZURE_OPENAI_API_KEY
 openai.azure_endpoint = AZURE_OPENAI_ENDPOINT.rstrip("/")
 
-# Flask & Bot setup
+# Flask app
 app = Flask(__name__)
-adapter_settings = BotFrameworkAdapterSettings(APP_ID, APP_PASSWORD)
-adapter = BotFrameworkAdapter(adapter_settings)
 
 # Simple memory store for user threads
 thread_map = {}
 
+# Twilio client
+twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 
-async def handle_message(turn_context: TurnContext):
-    # Send greeting only when bot is added to conversation
-    if turn_context.activity.type == "conversationUpdate":
-        members_added = turn_context.activity.members_added
-        if members_added:
-            for member in members_added:
-                # Greet when the bot itself is added, not others
-                if member.id == turn_context.activity.recipient.id:
-                    await turn_context.send_activity("Hello! How can I assist you today?")
-        return
 
-    # Only handle real messages with non-empty text
-    if turn_context.activity.type != "message" or not turn_context.activity.text or not turn_context.activity.text.strip():
-        return
-
-    user_id = turn_context.activity.from_property.id
-    user_input = turn_context.activity.text
-
+def process_with_assistant(user_id: str, user_input: str) -> str:
+    """
+    Send user input to Azure OpenAI Assistant and return reply
+    """
     try:
-        # Show typing indicator immediately
-        await turn_context.send_activity(Activity(type="typing"))
-
-        # Get or create thread ID for user
+        # Get or create thread
         thread_id = thread_map.get(user_id)
         if not thread_id:
             thread = openai.beta.threads.create()
             thread_id = thread.id
             thread_map[user_id] = thread_id
 
-        # Add user message to assistant thread
+        # Add message
         openai.beta.threads.messages.create(
             thread_id=thread_id,
             role="user",
             content=user_input
         )
 
-        # Start a new assistant run
+        # Run assistant
         run = openai.beta.threads.runs.create(
             assistant_id=ASSISTANT_ID,
             thread_id=thread_id
         )
 
-        # Poll until run completes/fails/cancelled
+        # Poll until complete
         while run.status not in ["completed", "failed", "cancelled"]:
             time.sleep(1)
             run = openai.beta.threads.runs.retrieve(
@@ -83,7 +70,7 @@ async def handle_message(turn_context: TurnContext):
                 run_id=run.id
             )
 
-        # Get last assistant message from the thread messages
+        # Get last assistant reply
         messages = openai.beta.threads.messages.list(thread_id=thread_id)
         assistant_reply = None
         for message in messages.data:
@@ -91,48 +78,43 @@ async def handle_message(turn_context: TurnContext):
                 assistant_reply = message.content[0].text.value
                 break
 
-        if not assistant_reply:
-            assistant_reply = "Sorry, I didn't get a reply from the assistant."
+        return assistant_reply or "Sorry, I didn’t get a reply."
 
     except Exception as e:
-        logging.error(f"Error handling message: {e}")
-        assistant_reply = "Something went wrong."
-
-    # Send the full reply after complete processing
-    await turn_context.send_activity(Activity(
-        type="message",
-        text=assistant_reply,
-        recipient=turn_context.activity.from_property,
-        from_property=turn_context.activity.recipient,
-        conversation=turn_context.activity.conversation,
-        channel_id=turn_context.activity.channel_id,
-        service_url=turn_context.activity.service_url
-    ))
+        logging.error(f"Assistant error: {e}")
+        return "Something went wrong while processing your request."
 
 
-@app.route("/api/messages", methods=["POST"])
-def messages():
+@app.route("/twilio/whatsapp", methods=["POST"])
+def whatsapp_webhook():
+    """
+    Twilio webhook for incoming WhatsApp messages
+    """
     try:
-        if "application/json" not in request.headers.get("Content-Type", ""):
-            return Response("Unsupported Media Type", status=415)
+        incoming_msg = request.form.get("Body", "").strip()
+        from_number = request.form.get("From", "")
 
-        activity = Activity().deserialize(request.json)
-        auth_header = request.headers.get("Authorization", "")
+        if not incoming_msg:
+            return str(MessagingResponse().message("Please send a valid message."))
 
-        async def process():
-            return await adapter.process_activity(activity, auth_header, handle_message)
+        # Process with Azure OpenAI Assistant
+        reply = process_with_assistant(from_number, incoming_msg)
 
-        asyncio.run(process())
-        return Response(status=200)
+        # Send response back to WhatsApp
+        resp = MessagingResponse()
+        resp.message(reply)
+        return str(resp)
 
     except Exception as e:
-        logging.error(f"Exception in /api/messages: {e}")
-        return Response("Internal Server Error", status=500)
+        logging.error(f"Webhook error: {e}")
+        resp = MessagingResponse()
+        resp.message("Error processing your message.")
+        return str(resp)
 
 
 @app.route("/", methods=["GET"])
 def health_check():
-    return "Teams Bot is running."
+    return "WhatsApp Bot with Azure OpenAI is running!"
 
 
 if __name__ == "__main__":
