@@ -36,90 +36,6 @@ thread_map = {}
 # Twilio client
 twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 
-# WhatsApp message length limit
-MAX_WHATSAPP_LENGTH = 1500  # Keep it under 1600 to be safe
-
-
-def split_message(message: str, max_length: int = MAX_WHATSAPP_LENGTH) -> list:
-    """
-    Split a long message into chunks that fit within WhatsApp's character limit
-    """
-    if len(message) <= max_length:
-        return [message]
-
-    chunks = []
-    current_chunk = ""
-
-    # Split by sentences first to maintain readability
-    sentences = message.split('. ')
-
-    for i, sentence in enumerate(sentences):
-        # Add period back except for last sentence
-        if i < len(sentences) - 1:
-            sentence += '. '
-
-        # Check if adding this sentence would exceed limit
-        if len(current_chunk + sentence) > max_length:
-            if current_chunk:
-                chunks.append(current_chunk.strip())
-                current_chunk = sentence
-            else:
-                # Single sentence is too long, split by words
-                words = sentence.split(' ')
-                for word in words:
-                    if len(current_chunk + ' ' + word) > max_length:
-                        if current_chunk:
-                            chunks.append(current_chunk.strip())
-                            current_chunk = word
-                        else:
-                            # Single word is too long, force split
-                            chunks.append(word[:max_length])
-                            current_chunk = word[max_length:]
-                    else:
-                        if current_chunk:
-                            current_chunk += ' ' + word
-                        else:
-                            current_chunk = word
-        else:
-            current_chunk += sentence
-
-    # Add remaining chunk
-    if current_chunk:
-        chunks.append(current_chunk.strip())
-
-    return chunks
-
-
-def send_whatsapp_message(to_number: str, message: str):
-    """
-    Send a WhatsApp message through Twilio, splitting if necessary
-    """
-    try:
-        message_chunks = split_message(message)
-
-        for i, chunk in enumerate(message_chunks):
-            # Add part indicator for multi-part messages
-            if len(message_chunks) > 1:
-                part_info = f" ({i+1}/{len(message_chunks)})"
-                # Ensure the part info doesn't exceed the limit
-                if len(chunk + part_info) <= MAX_WHATSAPP_LENGTH:
-                    chunk += part_info
-
-            twilio_client.messages.create(
-                from_=TWILIO_WHATSAPP_NUMBER,
-                body=chunk,
-                to=to_number
-            )
-
-            # Small delay between messages to ensure proper ordering
-            if i < len(message_chunks) - 1:
-                time.sleep(0.5)
-
-        logging.info(f"Sent {len(message_chunks)} message(s) to {to_number}")
-
-    except Exception as e:
-        logging.error(f"Error sending WhatsApp message: {e}")
-
 
 def process_with_assistant(user_id: str, user_input: str) -> str:
     """
@@ -162,7 +78,7 @@ def process_with_assistant(user_id: str, user_input: str) -> str:
                 assistant_reply = message.content[0].text.value
                 break
 
-        return assistant_reply or "Sorry, I didn't get a reply."
+        return assistant_reply or "Sorry, I didn’t get a reply."
 
     except Exception as e:
         logging.error(f"Assistant error: {e}")
@@ -179,23 +95,21 @@ def whatsapp_webhook():
         from_number = request.form.get("From", "")
 
         if not incoming_msg:
-            # Send short error message
-            send_whatsapp_message(from_number, "Please send a valid message.")
-            return str(MessagingResponse())
+            return str(MessagingResponse().message("Please send a valid message."))
 
         # Process with Azure OpenAI Assistant
         reply = process_with_assistant(from_number, incoming_msg)
 
-        # Send response using our custom function that handles splitting
-        send_whatsapp_message(from_number, reply)
-
-        # Return empty TwiML response since we're sending messages directly
-        return str(MessagingResponse())
+        # Send response back to WhatsApp
+        resp = MessagingResponse()
+        resp.message(reply)
+        return str(resp)
 
     except Exception as e:
         logging.error(f"Webhook error: {e}")
-        send_whatsapp_message(from_number, "Error processing your message.")
-        return str(MessagingResponse())
+        resp = MessagingResponse()
+        resp.message("Error processing your message.")
+        return str(resp)
 
 
 @app.route("/", methods=["GET"])
