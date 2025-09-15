@@ -4,7 +4,8 @@ import openai
 import logging
 from dotenv import load_dotenv
 from flask import Flask, request, Response
-
+from twilio.twiml.messaging_response import MessagingResponse
+from twilio.rest import Client
 
 # Load environment variables
 load_dotenv()
