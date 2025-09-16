@@ -2,8 +2,9 @@ import os
 import time
 import openai
 import logging
+import threading
 from dotenv import load_dotenv
-from flask import Flask, request, Response
+from flask import Flask, request
 from twilio.twiml.messaging_response import MessagingResponse
 from twilio.rest import Client
 
@@ -14,7 +15,8 @@ load_dotenv()
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 TWILIO_WHATSAPP_NUMBER = os.getenv(
-    "TWILIO_WHATSAPP_NUMBER", "whatsapp:+14155238886")  # Sandbox default
+    "TWILIO_WHATSAPP_NUMBER", "whatsapp:+14155238886"
+)  # Sandbox default
 
 # Azure OpenAI
 AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY")
@@ -51,23 +53,19 @@ def process_with_assistant(user_id: str, user_input: str) -> str:
 
         # Add message
         openai.beta.threads.messages.create(
-            thread_id=thread_id,
-            role="user",
-            content=user_input
+            thread_id=thread_id, role="user", content=user_input
         )
 
         # Run assistant
         run = openai.beta.threads.runs.create(
-            assistant_id=ASSISTANT_ID,
-            thread_id=thread_id
+            assistant_id=ASSISTANT_ID, thread_id=thread_id
         )
 
         # Poll until complete
         while run.status not in ["completed", "failed", "cancelled"]:
             time.sleep(1)
             run = openai.beta.threads.runs.retrieve(
-                thread_id=thread_id,
-                run_id=run.id
+                thread_id=thread_id, run_id=run.id
             )
 
         # Get last assistant reply
@@ -85,6 +83,30 @@ def process_with_assistant(user_id: str, user_input: str) -> str:
         return "Something went wrong while processing your request."
 
 
+def send_delayed_response(to_number: str, user_msg: str):
+    """
+    Run assistant in background and send response via Twilio REST API
+    """
+    try:
+        reply = process_with_assistant(to_number, user_msg)
+
+        # Simulate thinking delay
+        time.sleep(2)
+
+        # Split into chunks (Twilio max ~1600 chars per message)
+        chunks = [
+            reply[i: i + 1500] for i in range(0, len(reply), 1500)
+        ]  # leave margin
+
+        for chunk in chunks:
+            twilio_client.messages.create(
+                body=chunk, from_=TWILIO_WHATSAPP_NUMBER, to=to_number
+            )
+            time.sleep(1)  # avoid flooding
+    except Exception as e:
+        logging.error(f"Background send error: {e}")
+
+
 @app.route("/twilio/whatsapp", methods=["POST"])
 def whatsapp_webhook():
     """
@@ -95,14 +117,17 @@ def whatsapp_webhook():
         from_number = request.form.get("From", "")
 
         if not incoming_msg:
-            return str(MessagingResponse().message("Please send a valid message."))
+            return str(
+                MessagingResponse().message("Please send a valid message.")
+            )
 
-        # Process with Azure OpenAI Assistant
-        reply = process_with_assistant(from_number, incoming_msg)
-
-        # Send response back to WhatsApp
+        # Step 1: quick reply so Twilio doesn’t timeout
         resp = MessagingResponse()
-        resp.message(reply)
+        resp.message("⏳ Typing...")
+        threading.Thread(
+            target=send_delayed_response, args=(from_number, incoming_msg)
+        ).start()
+
         return str(resp)
 
     except Exception as e:
